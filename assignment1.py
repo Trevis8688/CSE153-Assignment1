@@ -316,7 +316,8 @@ SAMPLE_RATE = 22050
 N_MELS = 96
 N_CLASSES = 10
 AUDIO_DURATION = 10
-BATCH_SIZE = 32
+BATCH_SIZE = 64
+T3_EPOCHS = 30
 TAGS = ['rock', 'oldies', 'jazz', 'pop', 'dance', 'blues', 'punk', 'chill', 'electronic', 'country']
 
 
@@ -410,13 +411,13 @@ class CNNClassifier(nn.Module):
         self.b2 = block(32, 64)
         self.b3 = block(64, 128)
         self.b4 = nn.Sequential(
-            nn.Conv2d(128, 128, 3, padding=1, bias=False),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(128, 256, 3, padding=1, bias=False),
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1),
         )
         self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(128, n_classes)
+        self.fc = nn.Linear(256, n_classes)
 
     def forward(self, x):
         x = self.b1(x); x = self.b2(x); x = self.b3(x); x = self.b4(x)
@@ -466,7 +467,7 @@ def run_task3():
     model = CNNClassifier().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
     crit = nn.BCEWithLogitsLoss()
-    epochs = 25
+    epochs = T3_EPOCHS
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
 
     best_map = -1.0; best_state = None
