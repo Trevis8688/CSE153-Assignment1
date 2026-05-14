@@ -1,0 +1,8 @@
+Task 1 (Composer classification):
+Extracted ~94 hand-crafted MIDI features per file (pitch / duration / IOI / interval / velocity stats, 12-bin pitch-class histogram, 8-bin register histogram, 27-bin interval histogram, duration-bucket histogram, polyphony statistics, tempo and time-signature info, note density / count / total length), then trained an ensemble of Logistic Regression, Random Forest, and Gradient Boosting and soft-voted their predicted class probabilities to produce the final label.
+
+Task 2 (Temporal-order prediction):
+For each pair (s1, s2) I summarised each segment with boundary descriptors (first/last note pitch and velocity, head/tail pitch means, pitch-class histogram, overall pitch/velocity/duration statistics) and then built 40 pair-level features that explicitly compare the s1->s2 transition with the s2->s1 transition (forward vs. reverse pitch jumps, head-vs-tail pitch differences, velocity continuity, pitch-class similarity, plus the raw segment characteristics). I doubled the training set by swapping each pair and flipping its label, then trained the same Logistic Regression / Random Forest / Gradient Boosting ensemble and took the soft-vote argmax.
+
+Task 3 (Music tagging):
+Loaded each 10-second mp3 at 22.05 kHz, computed a 96-mel log-spectrogram, and standardised it per clip. Trained a 4-block CNN (Conv-BN-ReLU pairs with (2, 4) max-pools, ending with global average pooling and a linear head) using AdamW + cosine LR schedule for 25 epochs with BCEWithLogitsLoss for the multilabel target, plus SpecAugment-style random frequency / time masking on training samples and a 90/10 train/val split for early stopping by best validation mAP.

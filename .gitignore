@@ -1,0 +1,26 @@
+# Claude harness state (do not push)
+.claude/
+.claude-output/
+.claude-debug/
+
+# Assignment data (too large for git; fetch from Drive/Colab separately)
+student_files/
+student_files_updated.zip
+__MACOSX/
+
+# Prediction artifacts (regenerated on each run)
+predictions1.json
+predictions2.json
+predictions3.json
+
+# Logs / temp
+*.log
+task3_run.log
+*.pyc
+__pycache__/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
