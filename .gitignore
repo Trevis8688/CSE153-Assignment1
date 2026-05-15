@@ -2,6 +2,7 @@
 .claude/
 .claude-output/
 .claude-debug/
+CLAUDE.md
 
 # Assignment data (too large for git; fetch from Drive/Colab separately)
 student_files/

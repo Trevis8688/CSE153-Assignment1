@@ -15,7 +15,7 @@ import torchaudio
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, HistGradientBoostingClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import cross_val_score, StratifiedKFold
@@ -23,10 +23,9 @@ from sklearn.metrics import average_precision_score
 from tqdm import tqdm
 
 
-# Task 1: Composer classification
+# ============================ Task 1: Composer classification ============================
 
 T1_DATAROOT = "student_files/task1_composer_classification"
-TRANSPOSITIONS = list(range(-5, 7))  # -5..+6 semitones; augments training to make the model key-invariant
 
 
 def stats(arr):
@@ -37,67 +36,43 @@ def stats(arr):
     return [float(a.mean()), float(a.std()), float(a.min()), float(a.max()), float(np.median(a))]
 
 
-def task1_load_notes(path):
-    # parse a MIDI once; transposition reuses the parsed notes without re-reading the file
+def task1_features(path):
     midi = miditoolkit.MidiFile(os.path.join(T1_DATAROOT, path))
     tpq = midi.ticks_per_beat or 480
+
+    # gather notes from all (non-drum) instruments
     notes = []
     for inst in midi.instruments:
         if inst.is_drum:
             continue
         notes.extend(inst.notes)
-    if not notes:
+    if not notes:  # some files might only have a drum track
         for inst in midi.instruments:
             notes.extend(inst.notes)
     notes.sort(key=lambda n: (n.start, n.pitch))
-    tempos = np.array([t.tempo for t in midi.tempo_changes] or [120.0], dtype=np.float64)
-    if midi.time_signature_changes:
-        ts = (midi.time_signature_changes[0].numerator, midi.time_signature_changes[0].denominator)
-    else:
-        ts = (4, 4)
-    return notes, tpq, tempos, ts
-
-
-# Feature layout (see assignment of feats below):
-#   7 stat blocks * 5 values (pitches, durs, iois, intervals, vels, poly, abs_intervals) = 35
-#   pitch-class histogram (12) + key-centered pitch-class histogram (12)
-#   register histogram (8)
-#   melodic interval histogram (27) + skip-2 interval histogram (27)
-#   duration histogram (8)
-#   IOI ratio histogram (7)
-#   chord_frac (1)
-#   tempo stats (4)
-#   ts/density/length scalars (5)
-T1_FEATURE_DIM = 5 * 7 + 12 + 12 + 8 + 27 + 27 + 8 + 7 + 1 + 4 + 5  # = 146
-
-
-def task1_features(notes, tpq, tempos, ts, transpose=0):
     if not notes:
-        return np.zeros(T1_FEATURE_DIM)
+        return np.zeros(94)
 
-    pitches = np.array([n.pitch + transpose for n in notes], dtype=np.float64)
+    pitches = np.array([n.pitch for n in notes], dtype=np.float64)
     durs = np.array([n.end - n.start for n in notes], dtype=np.float64) / tpq
     starts = np.array([n.start for n in notes], dtype=np.float64)
     vels = np.array([n.velocity for n in notes], dtype=np.float64)
-    iois = np.diff(np.sort(np.unique(starts))) / tpq  # inter-onset intervals
-    order = np.argsort(starts)
-    ordered_pitch = pitches[order]
-    intervals = np.diff(ordered_pitch)  # melodic intervals
-    skip2 = ordered_pitch[2:] - ordered_pitch[:-2] if len(ordered_pitch) > 2 else np.array([])
+    iois = np.diff(np.sort(np.unique(starts))) / tpq          # inter-onset intervals
+    intervals = np.diff(pitches[np.argsort(starts)])          # melodic intervals
 
-    # pitch-class histogram, plus a transposition-invariant copy (rotated so most common pc is bin 0)
+    # pitch class histogram (which of the 12 notes get used)
     pc = np.zeros(12)
     for p in pitches:
         pc[int(p) % 12] += 1
     pc /= pc.sum() + 1e-9
-    pc_centered = np.roll(pc, -int(np.argmax(pc)))
 
+    # rough register histogram
     reg = np.zeros(8)
     for p in pitches:
-        reg[min(max(int(p) // 16, 0), 7)] += 1
+        reg[min(int(p) // 16, 7)] += 1
     reg /= reg.sum() + 1e-9
 
-    # polyphony profile from a note on/off sweep
+    # sweep note on/off events to get a polyphony profile
     events = []
     for n in notes:
         events.append((n.start, 1))
@@ -110,6 +85,13 @@ def task1_features(notes, tpq, tempos, ts, transpose=0):
         poly_profile.append(poly)
     poly_profile = np.array(poly_profile or [0.0], dtype=np.float64)
 
+    tempos = np.array([t.tempo for t in midi.tempo_changes] or [120.0], dtype=np.float64)
+    if midi.time_signature_changes:
+        ts_num = midi.time_signature_changes[0].numerator
+        ts_den = midi.time_signature_changes[0].denominator
+    else:
+        ts_num, ts_den = 4, 4
+
     total_beats = max((n.end for n in notes), default=1) / tpq
     density = len(notes) / max(total_beats, 1e-3)
 
@@ -121,24 +103,16 @@ def task1_features(notes, tpq, tempos, ts, transpose=0):
     feats += stats(vels)
     feats += stats(poly_profile)
     feats += list(pc)
-    feats += list(pc_centered)
     feats += list(reg)
 
-    # melodic-interval histogram, bucketed to [-13, +13] (transposition-invariant)
+    # histogram of melodic intervals, bucketed to [-13, +13]
     int_hist = np.zeros(27)
     for iv in intervals:
         int_hist[int(np.clip(iv + 13, 0, 26))] += 1
     int_hist /= int_hist.sum() + 1e-9
     feats += list(int_hist)
 
-    # skip-2 interval histogram (transposition-invariant): pitch difference across one intervening note
-    skip_hist = np.zeros(27)
-    for iv in skip2:
-        skip_hist[int(np.clip(iv + 13, 0, 26))] += 1
-    skip_hist /= skip_hist.sum() + 1e-9
-    feats += list(skip_hist)
-
-    # duration histogram (in beats)
+    # histogram of note durations (in beats)
     dur_edges = [0, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 1e9]
     dur_hist = np.zeros(len(dur_edges) - 1)
     for d in durs:
@@ -149,109 +123,51 @@ def task1_features(notes, tpq, tempos, ts, transpose=0):
     dur_hist /= dur_hist.sum() + 1e-9
     feats += list(dur_hist)
 
-    # absolute interval-size stats (melodic "leapiness")
-    abs_int = np.abs(intervals)
-    feats += stats(abs_int) if len(abs_int) else [0.0] * 5
-
-    # IOI ratio histogram (tempo-invariant rhythm signature): ratio of consecutive IOIs
-    ioi_ratio_hist = np.zeros(7)
-    if len(iois) > 1:
-        ratios = iois[1:] / (iois[:-1] + 1e-9)
-        ratio_edges = [0, 0.33, 0.6, 0.9, 1.1, 1.7, 3.0, 1e9]
-        for r in ratios:
-            for i in range(len(ratio_edges) - 1):
-                if ratio_edges[i] <= r < ratio_edges[i + 1]:
-                    ioi_ratio_hist[i] += 1
-                    break
-        ioi_ratio_hist /= ioi_ratio_hist.sum() + 1e-9
-    feats += list(ioi_ratio_hist)
-
-    # fraction of simultaneous note onsets (chordal vs monophonic texture)
-    n_onsets = len(np.unique(starts))
-    chord_frac = 1.0 - n_onsets / max(len(notes), 1)
-    feats += [chord_frac]
-
     feats += [float(tempos.mean()), float(tempos.std()), float(tempos.min()), float(tempos.max())]
-    feats += [float(ts[0]), float(ts[1]), float(density), float(len(notes)), float(total_beats)]
+    feats += [float(ts_num), float(ts_den), float(density), float(len(notes)), float(total_beats)]
     return np.array(feats, dtype=np.float64)
-
-
-def _task1_models():
-    return {
-        "logreg": Pipeline([
-            ("scale", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=3000, C=0.5, class_weight="balanced")),
-        ]),
-        "hgb": HistGradientBoostingClassifier(max_iter=400, learning_rate=0.06,
-                                              max_depth=None, l2_regularization=1.0,
-                                              random_state=0),
-        "rf": RandomForestClassifier(n_estimators=500, n_jobs=-1, random_state=0,
-                                     class_weight="balanced", min_samples_leaf=2),
-    }
 
 
 def run_task1():
     train = eval(open(os.path.join(T1_DATAROOT, "train.json")).read())
     test = eval(open(os.path.join(T1_DATAROOT, "test.json")).read())
+
     train_paths = list(train.keys())
     train_labels = np.array([int(train[k]) for k in train_paths])
     test_paths = list(test)
 
-    parsed = {}
-    for p in tqdm(train_paths + test_paths, desc="task1 parsing midi"):
-        parsed[p] = task1_load_notes(p)
+    feat_cache = {}
 
-    # un-augmented features used for the validation fold (honest CV)
-    X_base = np.nan_to_num(np.array([task1_features(*parsed[p]) for p in train_paths]))
+    def load(paths, desc):
+        out = []
+        for p in tqdm(paths, desc=desc):
+            if p not in feat_cache:
+                feat_cache[p] = task1_features(p)
+            out.append(feat_cache[p])
+        return np.nan_to_num(np.array(out), 0.0, 0.0, 0.0)
 
-    # honest CV: split on original pieces, augment ONLY the training fold so a transposed copy
-    # of a piece can never leak into its own validation fold
+    X_train = load(train_paths, "task1 train")
+    X_test = load(test_paths, "task1 test")
+
+    # try a few classifiers and check them with 5-fold CV
+    models = {
+        "logreg": Pipeline([
+            ("scale", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=2000, C=1.0, class_weight="balanced")),
+        ]),
+        "rf": RandomForestClassifier(n_estimators=400, n_jobs=-1, random_state=0, class_weight="balanced"),
+        "gb": GradientBoostingClassifier(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=0),
+    }
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
-    fold_acc = {name: [] for name in _task1_models()}
-    fold_acc["ensemble"] = []
-    for tr_idx, va_idx in skf.split(X_base, train_labels):
-        Xtr, ytr = [], []
-        for i in tr_idx:
-            notes, tpq, tempos, ts = parsed[train_paths[i]]
-            for t in TRANSPOSITIONS:
-                Xtr.append(task1_features(notes, tpq, tempos, ts, transpose=t))
-                ytr.append(train_labels[i])
-        Xtr = np.nan_to_num(np.array(Xtr))
-        ytr = np.array(ytr)
-        Xva = X_base[va_idx]
-        yva = train_labels[va_idx]
-
-        models = _task1_models()
-        probs = []
-        for name, m in models.items():
-            m.fit(Xtr, ytr)
-            pred = m.predict(Xva)
-            fold_acc[name].append((pred == yva).mean())
-            probs.append(m.predict_proba(Xva))
-        ens = models["hgb"].classes_[np.argmax(np.mean(probs, axis=0), axis=1)]
-        fold_acc["ensemble"].append((ens == yva).mean())
-
-    for name, accs in fold_acc.items():
-        print(f"[task1] {name}: honest CV acc = {np.mean(accs):.4f} +/- {np.std(accs):.4f}")
-
-    # final fit on ALL training pieces (augmented across keys), predict the un-transposed test set
-    Xtr, ytr = [], []
-    for i, p in enumerate(train_paths):
-        notes, tpq, tempos, ts = parsed[p]
-        for t in TRANSPOSITIONS:
-            Xtr.append(task1_features(notes, tpq, tempos, ts, transpose=t))
-            ytr.append(train_labels[i])
-    Xtr = np.nan_to_num(np.array(Xtr))
-    ytr = np.array(ytr)
-    X_test = np.nan_to_num(np.array([task1_features(*parsed[p]) for p in test_paths]))
-
-    models = _task1_models()
-    probs = []
     for name, m in models.items():
-        m.fit(Xtr, ytr)
-        probs.append(m.predict_proba(X_test))
-    classes = models["hgb"].classes_
-    preds = classes[np.argmax(np.mean(probs, axis=0), axis=1)]
+        scores = cross_val_score(m, X_train, train_labels, cv=skf, scoring="accuracy", n_jobs=-1)
+        print(f"[task1] {name}: CV acc = {scores.mean():.4f} +/- {scores.std():.4f}")
+
+    # fit all three and soft-vote their probabilities for the final prediction
+    fitted = {name: m.fit(X_train, train_labels) for name, m in models.items()}
+    probs = np.mean([m.predict_proba(X_test) for m in fitted.values()], axis=0)
+    classes = fitted["gb"].classes_
+    preds = classes[np.argmax(probs, axis=1)]
 
     pred_dict = {p: int(preds[i]) for i, p in enumerate(test_paths)}
     with open("predictions1.json", "w") as f:
@@ -259,7 +175,7 @@ def run_task1():
     print(f"[task1] wrote predictions1.json ({len(pred_dict)} entries)")
 
 
-# Task 2: Temporal order prediction 
+# ============================ Task 2: Temporal order prediction ============================
 
 T2_DATAROOT = "student_files/task2_next_sequence_prediction"
 
@@ -403,7 +319,7 @@ def run_task2():
     print(f"[task2] wrote predictions2.json ({len(pred_dict)} entries)")
 
 
-# Task 3: Audio tagging 
+# ============================ Task 3: Audio tagging ============================
 
 T3_DATAROOT = "student_files/task3_audio_classification"
 SAMPLE_RATE = 22050

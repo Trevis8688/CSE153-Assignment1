@@ -1,26 +1,8 @@
 Task 1 - Composer classification:
-Each MIDI file is summarized with 146 features: statistics over pitch, duration, velocity, melodic interval,
-skip-interval, and inter-onset interval; a pitch-class histogram plus a key-centered copy (rotated so the most
-common pitch class is bin zero); a register histogram, a melodic-interval histogram, a skip-2 interval
-histogram, an inter-onset-interval ratio histogram, a duration histogram; polyphony statistics, a chord-onset
-fraction, and tempo / time-signature / note-density information. The training set is then augmented by
-transposing every piece across twelve semitones, which forces the classifier to rely on key-invariant patterns
-rather than the specific key a piece happens to sit in. Cross-validation is done honestly: the split is over
-original pieces, and only the training fold is augmented, so a transposed copy of a piece can never appear in
-its own validation fold. A logistic regression, a random forest, and a histogram gradient boosting classifier
-are trained on the augmented data, and their predicted probabilities are averaged to pick the final composer.
+Each MIDI file is summarized with 94 features: pitch, duration, velocity, melodic interval, and inter-onset interval statistics, plus a pitch-class histogram, a register histogram, an interval histogram, a duration histogram, polyphony statistics, and tempo / time-signature / note-density information. A logistic regression, a random forest, and a gradient boosting classifier are trained on these features, and their predicted probabilities are averaged to pick the final composer.
 
 Task 2 - Temporal order prediction:
-Each segment is summarized (first and last note pitch and velocity, head and tail pitch means, pitch-class
-histogram, overall statistics). For a pair of segments, the features compare the segment-1-to-segment-2
-transition against the segment-2-to-segment-1 transition (pitch jumps, head-versus-tail differences, velocity
-continuity, pitch-class similarity). Because swapping a pair flips its label, the training data is doubled with
-the swapped pairs, and the same logistic regression / random forest / gradient boosting ensemble is trained.
+Each segment is summarized (first and last note pitch and velocity, head and tail pitch means, pitch-class histogram, overall statistics). For a pair of segments, the features compare the segment-1-to-segment-2 transition against the segment-2-to-segment-1 transition (pitch jumps, head-versus-tail differences, velocity continuity, pitch-class similarity). Because swapping a pair flips its label, the training data is doubled with the swapped pairs, and the same logistic regression / random forest / gradient boosting ensemble is trained.
 
 Task 3 - Music tagging:
-Each 10-second clip is loaded at 22.05 kHz and converted to a 96-bin log-mel spectrogram that is standardized
-per clip. The model is a 4-block convolutional neural network (convolution / batch-norm / ReLU blocks with max
-pooling, followed by global average pooling and a linear layer), trained with the AdamW optimizer and a cosine
-learning-rate schedule for 30 epochs using binary cross-entropy with logits loss. SpecAugment-style frequency
-and time masking is applied to the training clips, and a 90/10 train/validation split is used to keep the
-checkpoint with the best validation mean average precision (about 0.557).
+Each 10-second clip is loaded at 22.05 kHz and converted to a 96-bin log-mel spectrogram that is standardized per clip. The model is a 4-block convolutional neural network (convolution / batch-norm / ReLU blocks with max pooling, followed by global average pooling and a linear layer), trained with the AdamW optimizer and a cosine learning-rate schedule for 30 epochs using binary cross-entropy with logits loss. SpecAugment-style frequency and time masking is applied to the training clips, and a 90/10 train/validation split is used to keep the checkpoint with the best validation mean average precision (about 0.557).
