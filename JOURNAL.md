@@ -53,8 +53,27 @@ Best val mAP **0.6384** (up from 0.557 with the from-scratch CNN). Leaderboard m
 
 Tasks 1 and 2 were unchanged this round. Notebook: `notebooks/task3_cnn14_finetune.ipynb`.
 
+## Submission 4 — Task 1: from-scratch REMI Transformer
+
+**Date:** 2026-05-15
+**Best val acc:** 0.8926 (epoch 30)
+**Leaderboard:** TBD (awaiting submission)
+
+Hand features had run out of room. Switched Task 1 to a learned sequence model so it could pick up its own transposition and corpus invariances instead of getting them hand-rolled.
+
+- MIDIs tokenized with REMI via miditok (Bar, Position, Pitch, Velocity, Duration, Tempo, Time-signature tokens; vocab around 389).
+- Model is a small BERT encoder trained from scratch: 6 layers, 256-dimensional hidden size, 8 heads, 1024-dimensional feed-forward, learned positional embeddings (about 5 million parameters). Sequences are 512-token windows with a BOS sentinel and right padding. Mean pooling over non-pad positions feeds a linear classifier head over the 8 composer classes.
+- Transposition augmentation is implemented as a precomputed token-id remap per semitone offset in `range(-5, 7)`. At training time, each MIDI yields four random windows per epoch and each window is remapped with a randomly chosen offset. Bar, Position, Velocity, Duration, Tempo, and Time-signature tokens are untouched.
+- Class-weighted cross-entropy (inverse frequency, normalized to mean 1) handles the 13x imbalance between classes 1 and 7.
+- AdamW (lr 1e-4, weight decay 0.01), cosine schedule, grad-norm clip at 1.0, 30 epochs.
+- Validation split: stratified 90/10 over the original pieces. The val fold is never transposed and never windowed in training. Multi-window logit averaging is used both at validation time and at test time.
+
+Best val accuracy reached 0.8926 by epoch 30, and the training loss was still decreasing at the end (0.106), so the model has not started overfitting. This validation number is on un-augmented original pieces, so it should be more honest than the 0.90 cross-validation number the hand-feature ensemble produced. Notebook: `notebooks/task1_remi_transformer.ipynb`.
+
+The Task 1 section of `assignment1.py` was rewritten to mirror the notebook end to end, and `writeup.txt` was updated to describe the Transformer.
+
 ## Up next
 
-- **Task 1: from-scratch REMI Transformer** (in flight). Notebook `notebooks/task1_remi_transformer.ipynb`. A small BERT encoder over miditok REMI tokens with transposition augmentation in token space and multi-window inference. Target: clear the 0.66 leaderboard ceiling that hand features hit.
-- If Task 1 lands well, the same architecture can be reused for Task 2 (pair classification).
-- Cheap potential Task 3 wins: test-time augmentation (average predictions over a few shifted crops) and seed-ensembling. Worth ~0.01-0.02 each, but only after Task 1 is dealt with.
+- Submit and record the Task 1 leaderboard number.
+- If Task 1 transfers well to the leaderboard, port the same backbone to Task 2 as a sequence-pair classifier: concatenate `[BOS] tok(seg1) [SEP] tok(seg2)` and reuse the encoder + a binary head. Symmetric augmentation by also swapping pair order at training time.
+- Cheap Task 3 follow-ups if the Transformer rank is good: test-time augmentation (average predictions over a few shifted crops, worth around 0.01) and a second-seed ensemble (worth around 0.01).

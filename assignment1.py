@@ -6,6 +6,8 @@ import os
 import random
 
 import urllib.request
+from collections import Counter, defaultdict
+
 import numpy as np
 import miditoolkit
 import librosa
@@ -16,158 +18,271 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.model_selection import cross_val_score, StratifiedKFold, train_test_split
 from sklearn.metrics import average_precision_score
 from tqdm import tqdm
+from miditok import REMI, TokenizerConfig
+from transformers import BertConfig, BertModel
 
 
-# ============================ Task 1: Composer classification ============================
+# Task 1: Composer classification via REMI Transformer
 
 T1_DATAROOT = "student_files/task1_composer_classification"
+T1_TRANSPOSITIONS = list(range(-5, 7))   # token-space pitch shift for training augmentation
+T1_MAX_LEN = 512
+T1_STRIDE = 256                          # window stride at inference time
+T1_BATCH_SIZE = 32
+T1_EPOCHS = 30
+T1_LR = 1e-4
+T1_WEIGHT_DECAY = 0.01
+T1_N_CLASSES = 8
+T1_WINDOWS_PER_TRAIN_MIDI = 4            # random training windows seen per MIDI per epoch
+T1_DROPOUT = 0.1
 
 
-def stats(arr):
-    # mean / std / min / max / median, with a safe fallback for empty inputs
-    if len(arr) == 0:
-        return [0.0] * 5
-    a = np.asarray(arr, dtype=np.float64)
-    return [float(a.mean()), float(a.std()), float(a.min()), float(a.max()), float(np.median(a))]
+def t1_build_tokenizer():
+    cfg = TokenizerConfig(
+        pitch_range=(21, 109),
+        beat_res={(0, 4): 8, (4, 12): 4},
+        num_velocities=32,
+        use_chords=False, use_rests=False,
+        use_tempos=True, num_tempos=32, tempo_range=(40, 250),
+        use_time_signatures=True,
+        special_tokens=["PAD", "BOS", "EOS", "MASK"],
+    )
+    return REMI(cfg)
 
 
-def task1_features(path):
-    midi = miditoolkit.MidiFile(os.path.join(T1_DATAROOT, path))
-    tpq = midi.ticks_per_beat or 480
-
-    # gather notes from all (non-drum) instruments
-    notes = []
-    for inst in midi.instruments:
-        if inst.is_drum:
-            continue
-        notes.extend(inst.notes)
-    if not notes:  # some files might only have a drum track
-        for inst in midi.instruments:
-            notes.extend(inst.notes)
-    notes.sort(key=lambda n: (n.start, n.pitch))
-    if not notes:
-        return np.zeros(94)
-
-    pitches = np.array([n.pitch for n in notes], dtype=np.float64)
-    durs = np.array([n.end - n.start for n in notes], dtype=np.float64) / tpq
-    starts = np.array([n.start for n in notes], dtype=np.float64)
-    vels = np.array([n.velocity for n in notes], dtype=np.float64)
-    iois = np.diff(np.sort(np.unique(starts))) / tpq          # inter-onset intervals
-    intervals = np.diff(pitches[np.argsort(starts)])          # melodic intervals
-
-    # pitch class histogram (which of the 12 notes get used)
-    pc = np.zeros(12)
-    for p in pitches:
-        pc[int(p) % 12] += 1
-    pc /= pc.sum() + 1e-9
-
-    # rough register histogram
-    reg = np.zeros(8)
-    for p in pitches:
-        reg[min(int(p) // 16, 7)] += 1
-    reg /= reg.sum() + 1e-9
-
-    # sweep note on/off events to get a polyphony profile
-    events = []
-    for n in notes:
-        events.append((n.start, 1))
-        events.append((n.end, -1))
-    events.sort()
-    poly = 0
-    poly_profile = []
-    for _, delta in events:
-        poly += delta
-        poly_profile.append(poly)
-    poly_profile = np.array(poly_profile or [0.0], dtype=np.float64)
-
-    tempos = np.array([t.tempo for t in midi.tempo_changes] or [120.0], dtype=np.float64)
-    if midi.time_signature_changes:
-        ts_num = midi.time_signature_changes[0].numerator
-        ts_den = midi.time_signature_changes[0].denominator
+def t1_midi_to_ids(tokenizer, path):
+    # miditok 3.x returns a list of TokSequence (one per track); concatenate so each MIDI is one stream
+    seq = tokenizer(os.path.join(T1_DATAROOT, path))
+    if isinstance(seq, list):
+        ids = []
+        for s in seq:
+            ids.extend(s.ids)
     else:
-        ts_num, ts_den = 4, 4
+        ids = list(seq.ids)
+    return np.array(ids, dtype=np.int64)
 
-    total_beats = max((n.end for n in notes), default=1) / tpq
-    density = len(notes) / max(total_beats, 1e-3)
 
-    feats = []
-    feats += stats(pitches)
-    feats += stats(durs)
-    feats += stats(iois) if len(iois) else [0.0] * 5
-    feats += stats(intervals) if len(intervals) else [0.0] * 5
-    feats += stats(vels)
-    feats += stats(poly_profile)
-    feats += list(pc)
-    feats += list(reg)
+def t1_make_transpose_map(tokenizer, semitones, vocab_size):
+    # transposition is implemented as a per-token-id remap: every Pitch_X token id is rewritten
+    # to the Pitch_(X+semitones) id, leaving Bar / Position / Velocity / Duration / etc unchanged
+    mp = np.arange(vocab_size, dtype=np.int64)
+    for tok_str, tok_id in tokenizer.vocab.items():
+        if not tok_str.startswith("Pitch_"):
+            continue
+        try:
+            pitch = int(tok_str.split("_")[1])
+        except ValueError:
+            continue
+        target = f"Pitch_{pitch + semitones}"
+        if target in tokenizer.vocab:
+            mp[tok_id] = tokenizer.vocab[target]
+    return mp
 
-    # histogram of melodic intervals, bucketed to [-13, +13]
-    int_hist = np.zeros(27)
-    for iv in intervals:
-        int_hist[int(np.clip(iv + 13, 0, 26))] += 1
-    int_hist /= int_hist.sum() + 1e-9
-    feats += list(int_hist)
 
-    # histogram of note durations (in beats)
-    dur_edges = [0, 0.125, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 1e9]
-    dur_hist = np.zeros(len(dur_edges) - 1)
-    for d in durs:
-        for i in range(len(dur_edges) - 1):
-            if dur_edges[i] <= d < dur_edges[i + 1]:
-                dur_hist[i] += 1
-                break
-    dur_hist /= dur_hist.sum() + 1e-9
-    feats += list(dur_hist)
+def t1_pack_window(window_ids, pad_id, bos_id):
+    # prepend BOS as a sentinel and right-pad to T1_MAX_LEN; attention mask zeroes out pads
+    inner = window_ids[: T1_MAX_LEN - 1]
+    ids = np.full(T1_MAX_LEN, pad_id, dtype=np.int64)
+    ids[0] = bos_id
+    ids[1:1 + len(inner)] = inner
+    attn = np.zeros(T1_MAX_LEN, dtype=np.int64)
+    attn[: 1 + len(inner)] = 1
+    return ids, attn
 
-    feats += [float(tempos.mean()), float(tempos.std()), float(tempos.min()), float(tempos.max())]
-    feats += [float(ts_num), float(ts_den), float(density), float(len(notes)), float(total_beats)]
-    return np.array(feats, dtype=np.float64)
+
+def t1_enumerate_windows(tok_ids):
+    inner = T1_MAX_LEN - 1
+    L = len(tok_ids)
+    if L <= inner:
+        return [tok_ids]
+    starts = list(range(0, L - inner + 1, T1_STRIDE))
+    if starts[-1] + inner < L:
+        starts.append(L - inner)
+    return [tok_ids[s:s + inner] for s in starts]
+
+
+class T1TrainSet(Dataset):
+    # each draw returns a random window from a random MIDI with a random transposition
+    def __init__(self, tokens_list, labels, transpose_maps, pad_id, bos_id,
+                 n_per_midi=T1_WINDOWS_PER_TRAIN_MIDI):
+        self.tokens = tokens_list
+        self.labels = labels
+        self.transpose_maps = transpose_maps
+        self.pad_id = pad_id
+        self.bos_id = bos_id
+        self.n = n_per_midi
+
+    def __len__(self):
+        return len(self.tokens) * self.n
+
+    def __getitem__(self, idx):
+        midi_idx = idx % len(self.tokens)
+        tok = self.tokens[midi_idx]
+        semi = random.choice(T1_TRANSPOSITIONS)
+        tok = self.transpose_maps[semi][tok]
+        inner = T1_MAX_LEN - 1
+        if len(tok) <= inner:
+            window = tok
+        else:
+            start = random.randint(0, len(tok) - inner)
+            window = tok[start:start + inner]
+        ids, attn = t1_pack_window(window, self.pad_id, self.bos_id)
+        return torch.from_numpy(ids), torch.from_numpy(attn), int(self.labels[midi_idx])
+
+
+class T1EvalSet(Dataset):
+    # enumerate every window for every MIDI; aggregation by path is done at scoring time
+    def __init__(self, tokens_list, paths, pad_id, bos_id):
+        self.items = []
+        self.pad_id = pad_id
+        self.bos_id = bos_id
+        for tok, p in zip(tokens_list, paths):
+            for w in t1_enumerate_windows(tok):
+                self.items.append((w, p))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        window, p = self.items[idx]
+        ids, attn = t1_pack_window(window, self.pad_id, self.bos_id)
+        return torch.from_numpy(ids), torch.from_numpy(attn), p
+
+
+class RemiBert(nn.Module):
+    # small BERT encoder over REMI tokens, mean-pooled over non-pad positions into a class head
+    def __init__(self, vocab_size, n_classes, pad_id, max_len=T1_MAX_LEN,
+                 d_model=256, n_layers=6, n_heads=8, ff=1024, dropout=T1_DROPOUT):
+        super().__init__()
+        cfg = BertConfig(
+            vocab_size=vocab_size,
+            hidden_size=d_model,
+            num_hidden_layers=n_layers,
+            num_attention_heads=n_heads,
+            intermediate_size=ff,
+            max_position_embeddings=max_len,
+            type_vocab_size=1,
+            hidden_dropout_prob=dropout,
+            attention_probs_dropout_prob=dropout,
+            pad_token_id=pad_id,
+        )
+        self.bert = BertModel(cfg)
+        self.dropout = nn.Dropout(0.3)
+        self.head = nn.Linear(d_model, n_classes)
+
+    def forward(self, input_ids, attention_mask):
+        out = self.bert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        mask = attention_mask.unsqueeze(-1).float()
+        pooled = (out * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-6)
+        return self.head(self.dropout(pooled))
+
+
+def t1_aggregate_predictions(model, loader, device):
+    model.eval()
+    logits_by_path = defaultdict(list)
+    with torch.no_grad():
+        for ids, attn, paths in loader:
+            ids = ids.to(device); attn = attn.to(device)
+            logits = model(ids, attn).cpu().numpy()
+            for i, p in enumerate(paths):
+                logits_by_path[p].append(logits[i])
+    return {p: np.mean(np.stack(ls), axis=0) for p, ls in logits_by_path.items()}
+
+
+def t1_get_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def run_task1():
-    train = eval(open(os.path.join(T1_DATAROOT, "train.json")).read())
-    test = eval(open(os.path.join(T1_DATAROOT, "test.json")).read())
+    torch.manual_seed(0); np.random.seed(0); random.seed(0)
+    device = t1_get_device()
+    print("[task1] device:", device)
 
-    train_paths = list(train.keys())
-    train_labels = np.array([int(train[k]) for k in train_paths])
-    test_paths = list(test)
+    tokenizer = t1_build_tokenizer()
+    vocab_size = len(tokenizer)
+    pad_id = tokenizer["PAD_None"]
+    bos_id = tokenizer["BOS_None"]
 
-    feat_cache = {}
+    train_meta = eval(open(os.path.join(T1_DATAROOT, "train.json")).read())
+    test_list = eval(open(os.path.join(T1_DATAROOT, "test.json")).read())
+    train_paths = list(train_meta.keys())
+    train_labels = np.array([int(train_meta[p]) for p in train_paths])
+    test_paths = list(test_list)
 
-    def load(paths, desc):
-        out = []
-        for p in tqdm(paths, desc=desc):
-            if p not in feat_cache:
-                feat_cache[p] = task1_features(p)
-            out.append(feat_cache[p])
-        return np.nan_to_num(np.array(out), 0.0, 0.0, 0.0)
+    tokens = {}
+    for p in tqdm(train_paths + test_paths, desc="[task1] tokenizing"):
+        tokens[p] = t1_midi_to_ids(tokenizer, p)
 
-    X_train = load(train_paths, "task1 train")
-    X_test = load(test_paths, "task1 test")
+    transpose_maps = {s: t1_make_transpose_map(tokenizer, s, vocab_size) for s in T1_TRANSPOSITIONS}
 
-    # try a few classifiers and check them with 5-fold CV
-    models = {
-        "logreg": Pipeline([
-            ("scale", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=2000, C=1.0, class_weight="balanced")),
-        ]),
-        "rf": RandomForestClassifier(n_estimators=400, n_jobs=-1, random_state=0, class_weight="balanced"),
-        "gb": GradientBoostingClassifier(n_estimators=300, max_depth=3, learning_rate=0.05, random_state=0),
-    }
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=0)
-    for name, m in models.items():
-        scores = cross_val_score(m, X_train, train_labels, cv=skf, scoring="accuracy", n_jobs=-1)
-        print(f"[task1] {name}: CV acc = {scores.mean():.4f} +/- {scores.std():.4f}")
+    # 90/10 stratified split on original pieces; no augmentation in the val fold
+    tr_idx, va_idx = train_test_split(
+        np.arange(len(train_paths)), test_size=0.1, random_state=0, stratify=train_labels,
+    )
+    tr_tokens = [tokens[train_paths[i]] for i in tr_idx]
+    tr_labels = train_labels[tr_idx]
+    va_tokens = [tokens[train_paths[i]] for i in va_idx]
+    va_paths = [train_paths[i] for i in va_idx]
+    va_labels = train_labels[va_idx]
+    te_tokens = [tokens[p] for p in test_paths]
 
-    # fit all three and soft-vote their probabilities for the final prediction
-    fitted = {name: m.fit(X_train, train_labels) for name, m in models.items()}
-    probs = np.mean([m.predict_proba(X_test) for m in fitted.values()], axis=0)
-    classes = fitted["gb"].classes_
-    preds = classes[np.argmax(probs, axis=1)]
+    train_set = T1TrainSet(tr_tokens, tr_labels, transpose_maps, pad_id, bos_id)
+    val_set = T1EvalSet(va_tokens, va_paths, pad_id, bos_id)
+    test_set = T1EvalSet(te_tokens, test_paths, pad_id, bos_id)
+    loader_tr = DataLoader(train_set, batch_size=T1_BATCH_SIZE, shuffle=True)
+    loader_va = DataLoader(val_set, batch_size=T1_BATCH_SIZE, shuffle=False)
+    loader_te = DataLoader(test_set, batch_size=T1_BATCH_SIZE, shuffle=False)
+    val_label_lookup = {p: l for p, l in zip(va_paths, va_labels)}
 
-    pred_dict = {p: int(preds[i]) for i, p in enumerate(test_paths)}
+    model = RemiBert(vocab_size, T1_N_CLASSES, pad_id).to(device)
+    print(f"[task1] params: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
+
+    # inverse-frequency class weights handle the 13x imbalance (class 1 has ~490, class 7 has ~37)
+    cls_counts = Counter(int(c) for c in tr_labels)
+    weights = np.array([1.0 / cls_counts[i] for i in range(T1_N_CLASSES)], dtype=np.float32)
+    weights = weights / weights.mean()
+    cls_weight = torch.tensor(weights, device=device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=T1_LR, weight_decay=T1_WEIGHT_DECAY)
+    criterion = nn.CrossEntropyLoss(weight=cls_weight)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T1_EPOCHS)
+
+    best_acc = -1.0
+    best_state = None
+    for epoch in range(T1_EPOCHS):
+        model.train()
+        running, nb = 0.0, 0
+        for ids, attn, y in tqdm(loader_tr, desc=f"[task1] epoch {epoch+1}/{T1_EPOCHS}"):
+            ids = ids.to(device); attn = attn.to(device); y = y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(ids, attn), y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            running += loss.item(); nb += 1
+        scheduler.step()
+
+        val_logits = t1_aggregate_predictions(model, loader_va, device)
+        correct = sum(int(np.argmax(val_logits[p])) == int(val_label_lookup[p]) for p in va_paths)
+        val_acc = correct / max(len(va_paths), 1)
+        print(f"[task1 ep{epoch+1}] loss={running/nb:.4f} val_acc={val_acc:.4f}")
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    print(f"[task1] best val acc: {best_acc:.4f}")
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    test_logits = t1_aggregate_predictions(model, loader_te, device)
+    pred_dict = {p: int(np.argmax(test_logits[p])) for p in test_paths}
     with open("predictions1.json", "w") as f:
         f.write(repr(pred_dict) + "\n")
     print(f"[task1] wrote predictions1.json ({len(pred_dict)} entries)")
