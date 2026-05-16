@@ -57,7 +57,7 @@ Tasks 1 and 2 were unchanged this round. Notebook: `notebooks/task3_cnn14_finetu
 
 **Date:** 2026-05-15
 **Best val acc:** 0.8926 (epoch 30)
-**Leaderboard:** TBD (awaiting submission)
+**Leaderboard:** 0.5778 / 0.8739 / 0.6450 (rank 267)
 
 Hand features had run out of room. Switched Task 1 to a learned sequence model so it could pick up its own transposition and corpus invariances instead of getting them hand-rolled.
 
@@ -68,12 +68,21 @@ Hand features had run out of room. Switched Task 1 to a learned sequence model s
 - AdamW (lr 1e-4, weight decay 0.01), cosine schedule, grad-norm clip at 1.0, 30 epochs.
 - Validation split: stratified 90/10 over the original pieces. The val fold is never transposed and never windowed in training. Multi-window logit averaging is used both at validation time and at test time.
 
-Best val accuracy reached 0.8926 by epoch 30, and the training loss was still decreasing at the end (0.106), so the model has not started overfitting. This validation number is on un-augmented original pieces, so it should be more honest than the 0.90 cross-validation number the hand-feature ensemble produced. Notebook: `notebooks/task1_remi_transformer.ipynb`.
+Best val accuracy reached 0.8926 by epoch 30, but the leaderboard came back at 0.5778 - a 31-point validation-to-leaderboard gap, worse than the 24-point gap the hand-feature ensemble had. The Transformer overfit *more* than the hand features did, not less. Notebook: `notebooks/task1_remi_transformer.ipynb`.
 
-The Task 1 section of `assignment1.py` was rewritten to mirror the notebook end to end, and `writeup.txt` was updated to describe the Transformer.
+The likeliest single contributor is the inverse-frequency class weighting. Training labels are distributed 17 / 40 / 11 / 10 / 4 / 10 / 4 / 3 percent across the eight composers, but the Transformer's predictions on the test set came out 29 / 26 / 12 / 13 / 7 / 6 / 4 / 3 percent: predictions were pulled sharply away from the dominant class 1. If the leaderboard test set has class proportions close to the training set, that rebalancing actively hurts.
+
+## Submission 5 — Revert Task 1 to the 94-feature baseline
+
+**Date:** 2026-05-16
+**Leaderboard:** 0.6633 / 0.8739 / 0.6450 (best-of-submissions, since Gradescope keeps the highest per-task score)
+
+Task 1 reverted: `assignment1.py` Task 1 section restored to the 94-feature logistic regression / random forest / gradient boosting soft-vote ensemble that produced Submission 1, `writeup.txt` Task 1 paragraph restored, `predictions1.json` regenerated from the reverted code (deterministic with seed 0). The Transformer experiment was a clear regression and there is no cheap fix in sight: a third Task 1 experiment in a row that underperformed the very first baseline.
+
+Gradescope keeps the highest score per task across submissions, so the rank-relevant Task 1 score is still 0.6633 from Submission 1. Treating Task 1 as closed for now.
 
 ## Up next
 
-- Submit and record the Task 1 leaderboard number.
-- If Task 1 transfers well to the leaderboard, port the same backbone to Task 2 as a sequence-pair classifier: concatenate `[BOS] tok(seg1) [SEP] tok(seg2)` and reuse the encoder + a binary head. Symmetric augmentation by also swapping pair order at training time.
-- Cheap Task 3 follow-ups if the Transformer rank is good: test-time augmentation (average predictions over a few shifted crops, worth around 0.01) and a second-seed ensemble (worth around 0.01).
+- **Task 3 follow-ups (low risk, low reward, around +0.02 mAP).** Test-time augmentation (average predictions over a few shifted crops) and a second-seed ensemble. Cheap to wire up on Colab.
+- **Task 2 sequence model (higher risk, higher reward).** The same small Transformer backbone as Task 1 but for pair classification: concatenate `[BOS] tok(seg1) [SEP] tok(seg2)`, encode, binary head. Symmetric augmentation by swapping pair order at training time. Caveat: Task 1 told us a small Transformer can overfit hard on this dataset, so the same risk applies.
+- **No more hand-feature Task 1 work.** Three attempts have all underperformed the baseline.
