@@ -5,15 +5,13 @@
 import os
 import random
 
+import urllib.request
 import numpy as np
 import miditoolkit
 import librosa
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchaudio
 from torch.utils.data import Dataset, DataLoader, random_split
-from torchaudio.transforms import MelSpectrogram, AmplitudeToDB
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.pipeline import Pipeline
@@ -319,16 +317,20 @@ def run_task2():
     print(f"[task2] wrote predictions2.json ({len(pred_dict)} entries)")
 
 
-# ============================ Task 3: Audio tagging ============================
+# Task 3: Audio tagging via fine-tuned PANNs CNN14
 
 T3_DATAROOT = "student_files/task3_audio_classification"
-SAMPLE_RATE = 22050
-N_MELS = 96
-N_CLASSES = 10
+SAMPLE_RATE = 32000           # PANNs native sample rate; the backbone expects 32 kHz raw audio
 AUDIO_DURATION = 10
-BATCH_SIZE = 64
-T3_EPOCHS = 30
+N_CLASSES = 10
+T3_BATCH_SIZE = 32
+T3_EPOCHS = 25
+BACKBONE_LR = 1e-4            # small nudge on the pretrained backbone
+HEAD_LR = 1e-3                # larger step on the fresh classifier head
+MIXUP_ALPHA = 0.4
 TAGS = ['rock', 'oldies', 'jazz', 'pop', 'dance', 'blues', 'punk', 'chill', 'electronic', 'country']
+CNN14_URL = "https://zenodo.org/record/3987831/files/Cnn14_mAP%3D0.431.pth?download=1"
+CNN14_LOCAL = "Cnn14_mAP=0.431.pth"
 
 
 def get_device():
@@ -339,45 +341,27 @@ def get_device():
     return torch.device("cpu")
 
 
-def extract_waveform(path):
-    waveform, sr = librosa.load(os.path.join(T3_DATAROOT, path), sr=SAMPLE_RATE)
-    waveform = torch.FloatTensor(np.array([waveform]))
-    if sr != SAMPLE_RATE:
-        waveform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=SAMPLE_RATE)(waveform)
+def load_waveform(path):
+    # PANNs takes mono audio at 32 kHz, padded or truncated to a fixed 10-second window.
+    # The model has its own log-mel front-end, so no spectrogram computation is needed here.
+    waveform, _ = librosa.load(os.path.join(T3_DATAROOT, path), sr=SAMPLE_RATE)
     target_len = SAMPLE_RATE * AUDIO_DURATION
-    if waveform.shape[1] < target_len:
-        waveform = F.pad(waveform, (0, target_len - waveform.shape[1]))
+    if len(waveform) < target_len:
+        waveform = np.pad(waveform, (0, target_len - len(waveform)))
     else:
-        waveform = waveform[:, :target_len]
-    return waveform
+        waveform = waveform[:target_len]
+    return torch.from_numpy(waveform.astype(np.float32))
 
 
-class AudioDataset(Dataset):
+class TaggingDataset(Dataset):
+    # preloads all waveforms in memory, the dataset is small enough that this is faster than
+    # re-decoding each clip every epoch
     def __init__(self, meta):
         self.meta = meta
         self.ids = list(meta.keys())
-        self.mel = MelSpectrogram(sample_rate=SAMPLE_RATE, n_mels=N_MELS, n_fft=1024,
-                                  hop_length=256, f_min=20, f_max=SAMPLE_RATE // 2)
-        self.db = AmplitudeToDB(top_db=80)
-        # precompute mel spectrograms up front - the dataset is small enough to keep in memory
-        self.feats = {}
-        for path in tqdm(self.ids, desc="Preloading mels"):
-            w = extract_waveform(path)
-            m = self.db(self.mel(w)).squeeze(0)
-            m = (m - m.mean()) / (m.std() + 1e-6)  # per-clip standardization
-            self.feats[path] = m
-
-    def spec_augment(self, m):
-        # randomly zero out a frequency band and a time span (SpecAugment)
-        if random.random() < 0.5:
-            f = random.randint(0, 16)
-            f0 = random.randint(0, max(1, N_MELS - f))
-            m[f0:f0 + f, :] = 0
-        if random.random() < 0.5:
-            t = random.randint(0, 40)
-            t0 = random.randint(0, max(1, m.shape[1] - t))
-            m[:, t0:t0 + t] = 0
-        return m
+        self.cache = {}
+        for path in tqdm(self.ids, desc="Preloading waveforms"):
+            self.cache[path] = load_waveform(path)
 
     def __len__(self):
         return len(self.ids)
@@ -385,63 +369,46 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         path = self.ids[idx]
         label = torch.tensor([1 if t in self.meta[path] else 0 for t in TAGS], dtype=torch.float32)
-        return self.feats[path].unsqueeze(0), label, path
+        return self.cache[path], label, path
 
 
-class SplitView(Dataset):
-    # wraps a random_split subset so augmentation can be on for train and off for val
-    def __init__(self, subset, augment):
-        self.dataset = subset.dataset
-        self.indices = subset.indices
-        self.augment = augment
-
-    def __len__(self):
-        return len(self.indices)
-
-    def __getitem__(self, idx):
-        path = self.dataset.ids[self.indices[idx]]
-        label = torch.tensor([1 if t in self.dataset.meta[path] else 0 for t in TAGS], dtype=torch.float32)
-        m = self.dataset.feats[path].clone()
-        if self.augment:
-            m = self.dataset.spec_augment(m)
-        return m.unsqueeze(0), label, path
+def download_cnn14_checkpoint():
+    # The published PANNs CNN14 checkpoint from Zenodo, around 326 MB.
+    if not os.path.exists(CNN14_LOCAL):
+        print("[task3] downloading CNN14 checkpoint ...")
+        urllib.request.urlretrieve(CNN14_URL, CNN14_LOCAL)
+    return CNN14_LOCAL
 
 
-class CNNClassifier(nn.Module):
-    def __init__(self, n_classes=N_CLASSES):
+class Cnn14Tagger(nn.Module):
+    # PANNs CNN14 backbone with a fresh classifier head on top of its 2048-d embedding.
+    def __init__(self, ckpt_path, n_classes=N_CLASSES):
         super().__init__()
-
-        def conv_block(in_ch, out_ch, pool=(2, 4)):
-            return nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(pool),
-            )
-
-        self.block1 = conv_block(1, 32)
-        self.block2 = conv_block(32, 64)
-        self.block3 = conv_block(64, 128)
-        self.block4 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, padding=1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
+        from panns_inference.models import Cnn14
+        self.backbone = Cnn14(sample_rate=SAMPLE_RATE, window_size=1024, hop_size=320,
+                              mel_bins=64, fmin=50, fmax=14000, classes_num=527)
+        state = torch.load(ckpt_path, map_location="cpu")
+        self.backbone.load_state_dict(state["model"])
+        # the original 527-class fc_audioset is ignored; we take the embedding before it instead
+        self.head = nn.Sequential(
+            nn.Linear(2048, 512), nn.ReLU(inplace=True),
+            nn.Dropout(0.3),
+            nn.Linear(512, n_classes),
         )
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(256, n_classes)
 
     def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = x.view(x.size(0), -1)
-        x = self.dropout(x)
-        return self.fc(x)  # logits; sigmoid is applied later
+        # x: (batch, samples) raw waveform at 32 kHz
+        out = self.backbone(x)
+        return self.head(out["embedding"])
+
+
+def mixup_batch(x, y, alpha):
+    # blend two random samples in each batch and blend their multi-hot labels the same way
+    if alpha <= 0:
+        return x, y
+    lam = float(np.random.beta(alpha, alpha))
+    perm = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[perm], lam * y + (1 - lam) * y[perm]
 
 
 def evaluate(model, loader, device):
@@ -450,18 +417,16 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         for x, y, paths in loader:
             x = x.to(device)
-            y = y.to(device)
             all_logits.append(model(x).cpu())
-            all_targets.append(y.cpu())
+            all_targets.append(y)
             all_paths += list(paths)
     logits = torch.cat(all_logits)
     targets = torch.cat(all_targets).numpy()
     probs = torch.sigmoid(logits).numpy()
-
     mAP = None
-    if targets.sum() > 0:  # test set has no labels, so skip the metric there
+    if targets.sum() > 0:
         try:
-            mAP = average_precision_score(targets, probs, average='macro')
+            mAP = average_precision_score(targets, probs, average="macro")
         except Exception:
             mAP = None
     return probs, all_paths, mAP
@@ -478,26 +443,27 @@ def run_task3():
     train_meta = eval(open(os.path.join(T3_DATAROOT, "train.json")).read())
     test_meta = {k: [] for k in eval(open(os.path.join(T3_DATAROOT, "test.json")).read())}
 
-    full_train = AudioDataset(train_meta)
+    full_train = TaggingDataset(train_meta)
     g = torch.Generator().manual_seed(0)
     n_train = int(len(full_train) * 0.9)
     n_valid = len(full_train) - n_train
     train_sub, valid_sub = random_split(full_train, [n_train, n_valid], generator=g)
+    test_set = TaggingDataset(test_meta)
 
-    train_view = SplitView(train_sub, augment=True)
-    valid_view = SplitView(valid_sub, augment=False)
-    test_set = AudioDataset(test_meta)
+    loader_train = DataLoader(train_sub, batch_size=T3_BATCH_SIZE, shuffle=True)
+    loader_valid = DataLoader(valid_sub, batch_size=T3_BATCH_SIZE, shuffle=False)
+    loader_test = DataLoader(test_set, batch_size=T3_BATCH_SIZE, shuffle=False)
 
-    loader_train = DataLoader(train_view, batch_size=BATCH_SIZE, shuffle=True)
-    loader_valid = DataLoader(valid_view, batch_size=BATCH_SIZE, shuffle=False)
-    loader_test = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False)
-
-    model = CNNClassifier().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    ckpt = download_cnn14_checkpoint()
+    model = Cnn14Tagger(ckpt).to(device)
+    # different learning rates for the pretrained backbone and the fresh head
+    optimizer = torch.optim.AdamW([
+        {"params": model.backbone.parameters(), "lr": BACKBONE_LR},
+        {"params": model.head.parameters(),     "lr": HEAD_LR},
+    ], weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss()
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T3_EPOCHS)
 
-    # keep the checkpoint with the best validation mAP
     best_map = -1.0
     best_state = None
     for epoch in range(T3_EPOCHS):
@@ -505,10 +471,10 @@ def run_task3():
         running_loss = 0.0
         n_batches = 0
         for x, y, _ in tqdm(loader_train, desc=f"Epoch {epoch+1}/{T3_EPOCHS}"):
-            x = x.to(device)
-            y = y.to(device)
+            x = x.to(device); y = y.to(device)
+            x_mix, y_mix = mixup_batch(x, y, MIXUP_ALPHA)
             optimizer.zero_grad()
-            loss = criterion(model(x), y)
+            loss = criterion(model(x_mix), y_mix)
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
@@ -528,7 +494,7 @@ def run_task3():
     probs, paths, _ = evaluate(model, loader_test, device)
     pred_dict = {}
     for i, p in enumerate(paths):
-        key = p[2:] if p.startswith("./") else p  # autograder expects paths without the "./"
+        key = p[2:] if p.startswith("./") else p
         pred_dict[key] = {TAGS[j]: float(probs[i][j]) for j in range(N_CLASSES)}
 
     with open("predictions3.json", "w") as f:
