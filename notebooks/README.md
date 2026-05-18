@@ -1,6 +1,6 @@
 # Notebooks
 
-Colab notebooks used for the heavier models. All four expect `student_files_updated.zip` to be present in Google Drive at `/content/drive/MyDrive/CSE153/student_files_updated.zip`. Each notebook mounts Drive, unzips the data into `/content/work/student_files/`, trains its model, and writes its predictions JSON back to Drive at the corresponding path.
+Colab notebooks used for the heavier models. They all expect `student_files_updated.zip` to be present in Google Drive at `/content/drive/MyDrive/CSE153/student_files_updated.zip`. Each notebook mounts Drive, unzips the data into `/content/work/student_files/`, trains its model, and writes its predictions JSON back to Drive at the corresponding path.
 
 Run them on a GPU runtime (Runtime, Change runtime type, GPU; A100 or V100 preferred).
 
@@ -8,7 +8,9 @@ Run them on a GPU runtime (Runtime, Change runtime type, GPU; A100 or V100 prefe
 
 - **`baseline_starter.ipynb`** — course-provided baseline notebook with simple working solutions for all three tasks. Mostly here as a reference for the expected data formats and output shapes.
 
-- **`task1_remi_transformer.ipynb`** — Task 1 composer classification with a small BERT encoder trained from scratch over miditok REMI tokens. Augments by transposing in token space (-5 to +6 semitones). 6-layer encoder, 256-d hidden, 8 heads, around 5M parameters. Class-weighted cross-entropy, AdamW with cosine schedule, 30 epochs, 90/10 stratified split, multi-window logit averaging at inference. Writes `predictions1.json`.
+- **`task1_remi_transformer.ipynb`** — Task 1 composer classification with a small BERT encoder trained from scratch over miditok REMI tokens. Augments by transposing in token space (-5 to +6 semitones). 6-layer encoder, 256-d hidden, 8 heads, around 5M parameters. Class-weighted cross-entropy, AdamW with cosine schedule, 30 epochs, 90/10 stratified split, multi-window logit averaging at inference. Regressed on the leaderboard (0.5778 vs the 0.6633 hand-feature baseline); kept for reference and post-mortem context.
+
+- **`task1_midibert_finetune.ipynb`** — Task 1 composer classification by fine-tuning the pretrained MidiBERT-Piano BERT-base (`wazenmai/MIDI-BERT`, branch `CP`). Uses their CP tokenizer (four-field tokens per note) and their `SequenceClassification` head over the last hidden layer. AdamW with learning rate 2e-5, CrossEntropyLoss, 10 epochs, early-stop after 3 epochs without piece-level validation improvement, no class weighting, no schedule, no augmentation. Honest piece-level 90/10 split. Tokenized arrays and best checkpoint are cached to Drive so a runtime restart picks up where it left off. Writes `predictions1.json`.
 
 - **`task3_cnn_from_scratch.ipynb`** — the original Task 3 4-block CNN over 96-bin log-mel spectrograms, SpecAugment, AdamW with cosine schedule, 30 epochs. Superseded by the CNN14 fine-tune below; kept for reference.
 
